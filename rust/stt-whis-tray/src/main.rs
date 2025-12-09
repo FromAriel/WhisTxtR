@@ -7,7 +7,9 @@ use log::{error, info, warn};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::ffi::CStr;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -141,6 +143,7 @@ enum SpeechEvent {
     RecordingStarted,
     RecordingStopped,
     Processing,
+    Partial(String),
     Info(String),
     Transcript(String),
     Error(String),
@@ -318,6 +321,9 @@ fn app_loop(
                 info!("(speech) processing");
                 overlay.send(OverlayMsg::Processing);
             }
+            SpeechEvent::Partial(text) => {
+                overlay.send(OverlayMsg::Transcript(text));
+            }
             SpeechEvent::Info(msg) => info!("(speech) {}", msg),
             SpeechEvent::Error(msg) => error!("(speech) {}", msg),
             SpeechEvent::Transcript(text) => {
@@ -406,6 +412,8 @@ fn spawn_speech_runtime(
         let mut ctx_model: Option<String> = None;
         let mut lang_opt: Option<String> = None;
         let audio_buf = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let partial_flag = Arc::new(AtomicBool::new(false));
+        let mut partial_handle: Option<thread::JoinHandle<()>> = None;
         let host = cpal::default_host();
 
         let load_ctx = |path: &str,
@@ -428,7 +436,8 @@ fn spawn_speech_runtime(
         let transcribe = |ctx: &WhisperContext,
                           audio: &[f32],
                           sr: u32,
-                          language: Option<String>|
+                          language: Option<String>,
+                          evt_tx: &Sender<SpeechEvent>|
          -> Result<String, String> {
             let mut state = ctx.create_state().map_err(|e| format!("state: {e}"))?;
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -446,14 +455,56 @@ fn spawn_speech_runtime(
             params.set_print_progress(false);
             params.set_print_timestamps(false);
 
+            // Stream partial segments via callback.
+            unsafe extern "C" fn on_new_segment(
+                _: *mut whisper_rs::whisper_rs_sys::whisper_context,
+                state: *mut whisper_rs::whisper_rs_sys::whisper_state,
+                n_new: std::ffi::c_int,
+                user: *mut std::ffi::c_void,
+            ) {
+                if user.is_null() || state.is_null() {
+                    return;
+                }
+                let tx = &*(user as *const Sender<SpeechEvent>);
+                let total =
+                    whisper_rs::whisper_rs_sys::whisper_full_n_segments_from_state(state);
+                if total <= 0 {
+                    return;
+                }
+                let start = (total - n_new).max(0);
+                for i in start..total {
+                    let cstr = whisper_rs::whisper_rs_sys::whisper_full_get_segment_text_from_state(
+                        state, i,
+                    );
+                    if !cstr.is_null() {
+                        if let Ok(txt) = CStr::from_ptr(cstr).to_str() {
+                            let _ = tx.send(SpeechEvent::Partial(txt.to_string()));
+                        }
+                    }
+                }
+            }
+
+            // Keep sender alive for the duration of `full`.
+            let tx_box: Box<Sender<SpeechEvent>> = Box::new(evt_tx.clone());
+            let tx_ptr = Box::into_raw(tx_box);
+            unsafe {
+                params.set_new_segment_callback(Some(on_new_segment));
+                params.set_new_segment_callback_user_data(tx_ptr as *mut _);
+            }
+
             let pcm = if sr == 16_000 {
                 audio.to_vec()
             } else {
                 resample_to_16k(audio, sr)
             };
-            state
-                .full(params, &pcm)
-                .map_err(|e| format!("transcribe: {e}"))?;
+            let res = state.full(params, &pcm).map_err(|e| format!("transcribe: {e}"));
+
+            // Reclaim the boxed sender to avoid leak.
+            unsafe {
+                let _ = Box::from_raw(tx_ptr);
+            }
+            res?;
+
             let num_segments = state
                 .full_n_segments()
                 .map_err(|e| format!("segments: {e}"))?;
@@ -570,6 +621,54 @@ fn spawn_speech_runtime(
                             } else {
                                 stream = Some(s);
                                 let _ = evt_tx.send(SpeechEvent::RecordingStarted);
+                                // Kick off partial transcription thread (streams overlay only).
+                                if partial_handle.is_none() {
+                                    let buf_clone = audio_buf.clone();
+                                    let flag = partial_flag.clone();
+                                    let evt_partial = evt_tx.clone();
+                                    let lang_partial = lang_opt.clone();
+                                    let model_partial = model_path.clone();
+                                    partial_flag.store(true, Ordering::SeqCst);
+                                    partial_handle = Some(thread::spawn(move || {
+                                        let mut local_ctx: Option<WhisperContext> = None;
+                                        let mut last_text = String::new();
+                                        while flag.load(Ordering::SeqCst) {
+                                            if !Path::new(&model_partial).exists() {
+                                                break;
+                                            }
+                                            if local_ctx.is_none() {
+                                                local_ctx = WhisperContext::new(&model_partial).ok();
+                                            }
+                                            if let Some(ctx_local) = local_ctx.as_ref() {
+                                                let samples: Vec<f32> = {
+                                                    if let Some(guard) = buf_clone.try_lock() {
+                                                        let tail = guard.len().saturating_sub(16_000 * 10);
+                                                        guard[tail..].to_vec()
+                                                    } else {
+                                                        Vec::new()
+                                                    }
+                                                };
+                                                if samples.len() > 16_000 {
+                                                    if let Ok(txt) = transcribe_partial(
+                                                        ctx_local,
+                                                        &samples,
+                                                        last_sr,
+                                                        lang_partial.clone(),
+                                                    ) {
+                                                        if !txt.is_empty() && txt != last_text {
+                                                            last_text = txt.clone();
+                                                            let _ = evt_partial
+                                                                .send(SpeechEvent::Partial(txt));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            thread::sleep(Duration::from_millis(900));
+                                        }
+                                    }));
+                                } else {
+                                    partial_flag.store(true, Ordering::SeqCst);
+                                }
                             }
                         }
                         Err(e) => {
@@ -581,6 +680,11 @@ fn spawn_speech_runtime(
                     }
                 }
                 SpeechCommand::Stop | SpeechCommand::Cancel => {
+                    // Stop partial thread
+                    partial_flag.store(false, Ordering::SeqCst);
+                    if let Some(h) = partial_handle.take() {
+                        let _ = h.join();
+                    }
                     if stream.is_some() {
                         stream = None;
                         let _ = evt_tx.send(SpeechEvent::RecordingStopped);
@@ -604,7 +708,13 @@ fn spawn_speech_runtime(
                     }
                     let _ = evt_tx.send(SpeechEvent::Processing);
                     if let Some(ctx_loaded) = ctx.as_ref() {
-                        match transcribe(ctx_loaded, &samples, last_sr, lang_opt.clone()) {
+                        match transcribe(
+                            ctx_loaded,
+                            &samples,
+                            last_sr,
+                            lang_opt.clone(),
+                            &evt_tx,
+                        ) {
                             Ok(t) => {
                                 let _ = evt_tx.send(SpeechEvent::Info(format!(
                                     "Transcript length: {} chars",
@@ -662,6 +772,56 @@ fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
         out.push(s0 + (s1 - s0) * frac);
     }
     out
+}
+
+fn transcribe_partial(
+    ctx: &WhisperContext,
+    audio: &[f32],
+    sr: u32,
+    language: Option<String>,
+) -> Result<String, String> {
+    let mut state = ctx.create_state().map_err(|e| format!("state: {e}"))?;
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    let threads = std::thread::available_parallelism()
+        .unwrap_or_else(|_| NonZeroUsize::new(2).unwrap())
+        .get();
+    params.set_n_threads(threads as i32);
+    if let Some(lang) = language.as_deref() {
+        params.set_language(Some(lang));
+    } else {
+        params.set_language(None);
+    }
+    params.set_translate(false);
+    params.set_print_realtime(false);
+    params.set_print_progress(false);
+    params.set_print_timestamps(false);
+    params.set_single_segment(true);
+
+    let pcm = if sr == 16_000 {
+        audio.to_vec()
+    } else {
+        resample_to_16k(audio, sr)
+    };
+    // Shorten to last 10s to keep latency low
+    let max_samples = 16_000 * 10;
+    let pcm_tail = if pcm.len() > max_samples {
+        pcm[pcm.len() - max_samples..].to_vec()
+    } else {
+        pcm
+    };
+
+    state
+        .full(params, &pcm_tail)
+        .map_err(|e| format!("transcribe partial: {e}"))?;
+
+    let num_segments = state
+        .full_n_segments()
+        .map_err(|e| format!("segments: {e}"))?;
+    let mut out = String::new();
+    for i in 0..num_segments {
+        out.push_str(&state.full_get_segment_text(i).unwrap_or_default());
+    }
+    Ok(out.trim().to_string())
 }
 
 // ----- Overlay (recording HUD) -----
@@ -994,13 +1154,7 @@ fn paint_overlay(hdc: HDC, state: &OverlayState) {
             state.text.as_str()
         };
         let body_w = wide(body);
-        TextOutW(
-            hdc,
-            12,
-            50,
-            body_w.as_ptr(),
-            (body_w.len() - 1) as i32,
-        );
+        TextOutW(hdc, 44, 50, body_w.as_ptr(), (body_w.len() - 1) as i32);
     }
 }
 
