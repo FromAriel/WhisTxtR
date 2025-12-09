@@ -20,23 +20,21 @@ use whisper_rs::{
 };
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, Ellipse, EndPaint, FillRect, InvalidateRect,
-    SelectObject, SetBkMode, SetTextColor, TextOutW, HBRUSH, HDC, PAINTSTRUCT, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, Ellipse, FillRect, GetDC, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor, TextOutW, HBRUSH, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW,
-    GetWindowLongPtrW, KillTimer, LoadIconW, LoadImageW, MoveWindow, PeekMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, RemoveMenu, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, HMENU,
-    HWND_TOPMOST, IDI_APPLICATION, IMAGE_ICON, LR_SHARED, MF_BYPOSITION, MSG, PM_REMOVE, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WNDCLASSW, WM_APP, WM_COMMAND, WM_DESTROY,
-    WM_NULL, WM_PAINT, WM_QUIT, WM_RBUTTONUP, WM_TIMER, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_OVERLAPPEDWINDOW, WS_POPUP,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, LoadIconW,
+    LoadImageW, MoveWindow, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, RemoveMenu,
+    SetForegroundWindow, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT,
+    HMENU, HWND_TOPMOST, IDI_APPLICATION, IMAGE_ICON, LR_SHARED, MF_BYPOSITION, MSG, PM_REMOVE,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WNDCLASSW, WM_COMMAND, WM_DESTROY, WM_NULL,
+    WM_PAINT, WM_QUIT, WM_RBUTTONUP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP,
 };
 
 const DEFAULT_MODEL_PATH: &str = "J:/whistxt/models/ggml-small-q5_1.bin";
@@ -50,9 +48,6 @@ const ID_TRAY_QUIT: u16 = 1;
 const ID_TRAY_STARTUP: u16 = 2;
 const OVERLAY_WIDTH: i32 = 520;
 const OVERLAY_HEIGHT: i32 = 120;
-const WM_OVERLAY_UPDATE: u32 = WM_APP + 1;
-const OVERLAY_TIMER_ID: usize = 1;
-const OVERLAY_BLINK_MS: u32 = 500;
 const OVERLAY_HIDE_DELAY_MS: u128 = 2500;
 
 #[derive(Debug, Error)]
@@ -682,11 +677,6 @@ struct OverlayState {
     blink_on: bool,
 }
 
-struct OverlayShared {
-    state: Mutex<OverlayState>,
-    queue: Mutex<Vec<OverlayMsg>>,
-}
-
 struct OverlayHandle {
     tx: Sender<OverlayMsg>,
 }
@@ -745,19 +735,14 @@ fn run_overlay(rx: Receiver<OverlayMsg>) -> Result<(), String> {
             return Err("CreateWindowExW failed".into());
         }
 
-        let shared = Arc::new(OverlayShared {
-            state: Mutex::new(OverlayState {
-                recording: false,
-                processing: false,
-                text: String::from("Ready"),
-                visible: true,
-                last_update: std::time::Instant::now(),
-                blink_on: true,
-            }),
-            queue: Mutex::new(Vec::new()),
-        });
-        let shared_for_wnd = Arc::clone(&shared);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::into_raw(shared_for_wnd) as isize);
+        let mut state = OverlayState {
+            recording: false,
+            processing: false,
+            text: String::from("Overlay test..."),
+            visible: true, // force-visible for debug
+            last_update: std::time::Instant::now(),
+            blink_on: true,
+        };
 
         // Position at bottom center
         let sx = GetSystemMetrics(0);
@@ -772,63 +757,85 @@ fn run_overlay(rx: Receiver<OverlayMsg>) -> Result<(), String> {
             y,
             OVERLAY_WIDTH,
             OVERLAY_HEIGHT,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
         );
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        InvalidateRect(hwnd, std::ptr::null(), 1);
+        draw_overlay(hwnd, &state);
 
-        // Bridge the channel onto the window thread so GetMessageW can stay blocking.
-        let hwnd_for_thread = hwnd;
-        let shared_for_queue = Arc::clone(&shared);
-        thread::spawn(move || {
-            while let Ok(msg) = rx.recv() {
-                {
-                    let mut q = shared_for_queue.queue.lock();
-                    q.push(msg);
-                }
-                PostMessageW(hwnd_for_thread, WM_OVERLAY_UPDATE, 0, 0);
-            }
-            PostMessageW(hwnd_for_thread, WM_QUIT, 0, 0);
-        });
-
-        SetTimer(hwnd, OVERLAY_TIMER_ID, OVERLAY_BLINK_MS, None);
-
-        let mut msg: MSG = std::mem::zeroed();
-        while GetMessageW(&mut msg, 0, 0, 0) != 0 {
-            if msg.message == WM_TIMER && msg.wParam == OVERLAY_TIMER_ID {
-                let mut hide_now = false;
-                {
-                    let mut st = shared.state.lock();
-                    if st.recording || st.processing {
-                        st.blink_on = !st.blink_on;
+        loop {
+            // Process overlay messages
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(msg) => {
+                    match msg {
+                        OverlayMsg::RecordingStart => {
+                            state.recording = true;
+                            state.processing = false;
+                            state.text.clear();
+                            state.visible = true;
+                            state.last_update = std::time::Instant::now();
+                        }
+                        OverlayMsg::Processing => {
+                            state.processing = true;
+                            state.recording = false;
+                            state.visible = true;
+                            state.last_update = std::time::Instant::now();
+                        }
+                        OverlayMsg::Transcript(t) => {
+                            state.text = t;
+                            state.processing = false;
+                            state.recording = false;
+                            state.visible = true;
+                            state.last_update = std::time::Instant::now();
+                        }
+                        OverlayMsg::Hide => {
+                            state.recording = false;
+                            state.processing = false;
+                            state.visible = false;
+                        }
                     }
-                    if st.visible
-                        && !st.recording
-                        && !st.processing
-                        && st.last_update.elapsed().as_millis() > OVERLAY_HIDE_DELAY_MS
-                    {
-                        st.visible = false;
-                        hide_now = true;
+                    if state.visible {
+                        SetWindowPos(
+                            hwnd,
+                            HWND_TOPMOST,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                        );
+                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        draw_overlay(hwnd, &state);
+                    } else {
+                        ShowWindow(hwnd, SW_HIDE);
                     }
                 }
-                if hide_now {
-                    ShowWindow(hwnd, SW_HIDE);
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // auto-hide when idle
+                    if state.visible && !state.recording && !state.processing {
+                        if state.last_update.elapsed().as_millis() > OVERLAY_HIDE_DELAY_MS {
+                            state.visible = false;
+                            ShowWindow(hwnd, SW_HIDE);
+                        }
+                    }
+                    // blink toggle
+                    if state.recording || state.processing {
+                        state.blink_on = !state.blink_on;
+                    }
+                    if state.visible {
+                        draw_overlay(hwnd, &state);
+                    }
                 }
-                InvalidateRect(hwnd, std::ptr::null(), 0);
-                continue;
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if msg.message == WM_OVERLAY_UPDATE {
-                apply_overlay_queue(hwnd, &shared);
-                continue;
+            // Pump window messages
+            let mut msg: MSG = std::mem::zeroed();
+            while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                if msg.message == WM_QUIT as u32 {
+                    return Ok(());
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-
-        KillTimer(hwnd, OVERLAY_TIMER_ID);
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const OverlayShared;
-        if !ptr.is_null() {
-            let _ = Arc::from_raw(ptr);
         }
         Ok(())
     }
@@ -843,20 +850,7 @@ extern "system" fn overlay_wnd_proc(
 ) -> LRESULT {
     unsafe {
         match msg {
-            WM_PAINT => {
-                let mut ps: PAINTSTRUCT = std::mem::zeroed();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                if hdc != 0 {
-                    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const OverlayShared;
-                    if !ptr.is_null() {
-                        let shared = &*ptr;
-                        let st = shared.state.lock();
-                        paint_overlay(hdc, &st);
-                    }
-                    EndPaint(hwnd, &mut ps);
-                }
-                0
-            }
+            WM_PAINT => 0,
             WM_DESTROY => {
                 PostQuitMessage(0);
                 0
@@ -866,73 +860,14 @@ extern "system" fn overlay_wnd_proc(
     }
 }
 
-fn apply_overlay_queue(hwnd: HWND, shared: &Arc<OverlayShared>) {
-    let mut do_show = false;
-    let mut do_hide = false;
-    {
-        let mut queue = shared.queue.lock();
-        if queue.is_empty() {
+fn draw_overlay(hwnd: HWND, state: &OverlayState) {
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if hdc == 0 {
             return;
         }
-        let mut st = shared.state.lock();
-        for msg in queue.drain(..) {
-            match msg {
-                OverlayMsg::RecordingStart => {
-                    st.recording = true;
-                    st.processing = false;
-                    st.text.clear();
-                    st.visible = true;
-                    st.last_update = Instant::now();
-                    st.blink_on = true;
-                }
-                OverlayMsg::Processing => {
-                    st.processing = true;
-                    st.recording = false;
-                    st.visible = true;
-                    st.last_update = Instant::now();
-                    st.blink_on = true;
-                }
-                OverlayMsg::Transcript(t) => {
-                    st.text = t;
-                    st.processing = false;
-                    st.recording = false;
-                    st.visible = true;
-                    st.last_update = Instant::now();
-                    st.blink_on = true;
-                }
-                OverlayMsg::Hide => {
-                    st.recording = false;
-                    st.processing = false;
-                    st.visible = false;
-                }
-            }
-        }
-        do_show = st.visible;
-        do_hide = !st.visible;
-    }
-    if do_show {
-        unsafe {
-            SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            InvalidateRect(hwnd, std::ptr::null(), 1);
-        }
-    } else if do_hide {
-        unsafe {
-            ShowWindow(hwnd, SW_HIDE);
-        }
-    }
-}
+        let dc = hdc;
 
-fn paint_overlay(hdc: HDC, state: &OverlayState) {
-    unsafe {
         let rect = RECT {
             left: 0,
             top: 0,
@@ -941,12 +876,12 @@ fn paint_overlay(hdc: HDC, state: &OverlayState) {
         };
         // black background
         let back_br = CreateSolidBrush(colorref(0, 0, 0));
-        FillRect(hdc, &rect, back_br);
+        FillRect(dc, &rect, back_br);
         DeleteObject(back_br as _);
 
         // Text color white
-        SetTextColor(hdc, colorref(255, 255, 255));
-        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(dc, colorref(255, 255, 255));
+        SetBkMode(dc, TRANSPARENT as i32);
 
         // Blinking circle
         let dot_br = CreateSolidBrush(if state.blink_on {
@@ -955,16 +890,16 @@ fn paint_overlay(hdc: HDC, state: &OverlayState) {
             colorref(120, 120, 120)
         });
         let circle_size = 18;
-        let old = SelectObject(hdc, dot_br as _);
+        let old = SelectObject(dc, dot_br as _);
         Ellipse(
-            hdc,
+            dc,
             12,
             (OVERLAY_HEIGHT - circle_size) / 2,
             12 + circle_size,
             (OVERLAY_HEIGHT - circle_size) / 2 + circle_size,
         );
         if old != 0 {
-            SelectObject(hdc, old);
+            SelectObject(dc, old);
         }
         DeleteObject(dot_br as _);
 
@@ -977,7 +912,19 @@ fn paint_overlay(hdc: HDC, state: &OverlayState) {
             "Transcript"
         };
         let status_w = wide(&format!("WhisTxtR - {}", status));
-        TextOutW(hdc, 40, 14, status_w.as_ptr(), (status_w.len() - 1) as i32);
+        let status_rect = RECT {
+            left: 40,
+            top: 14,
+            right: OVERLAY_WIDTH - 10,
+            bottom: 40,
+        };
+        TextOutW(
+            dc,
+            status_rect.left,
+            status_rect.top,
+            status_w.as_ptr(),
+            (status_w.len() - 1) as i32,
+        );
 
         // Body text
         let body = if state.recording {
@@ -994,13 +941,21 @@ fn paint_overlay(hdc: HDC, state: &OverlayState) {
             state.text.as_str()
         };
         let body_w = wide(body);
+        let body_rect = RECT {
+            left: 12,
+            top: 50,
+            right: OVERLAY_WIDTH - 12,
+            bottom: OVERLAY_HEIGHT - 12,
+        };
         TextOutW(
-            hdc,
-            12,
-            50,
+            dc,
+            body_rect.left,
+            body_rect.top,
             body_w.as_ptr(),
             (body_w.len() - 1) as i32,
         );
+
+        ReleaseDC(hwnd, hdc);
     }
 }
 

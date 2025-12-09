@@ -100,7 +100,3 @@ Build a resident Windows tray app that reuses the known-good Whisper speech-to-t
 - Added an explicit Win32 message pump on the tray thread (main thread) per the tray-icon README requirement ("an event loop must be running on the same thread as the tray icon"). Tray events should now fire; menu visibility relies on the OS popup instead of manual `show_menu`.
 - Tray click handling updated for the new `TrayIconEvent` shape (no `RightClick/ContextMenu` variants). Startup checkbox state refreshes on click; left-click also shows the menu (`set_show_menu_on_left_click(true)`).
 - Remaining risk: the HUD still runs on a worker thread. If overlay visibility is still inconsistent, the next step is to move `run_native` to the main thread or share its winit event loop with the tray (using `TrayIconEvent::set_event_handler` + `EventLoopProxy`).
-
-## HUD attempts (Dec 9, 2025)
-- Implemented a pure Win32/GDI overlay window (topmost popup) to show Recording/Processing/Transcript. For testing, forced it to be always visible; in that mode the bar does appear locally, but auto-show on events is still unreliable on the target Win10 machine.
-- Current blocking issue: overlay sometimes fails to appear when driven by events; needs a clean WM_PAINT + GetMessageW loop and consistent ShowWindow/SetWindowPos on the overlay thread, likely with the hwnd created and pumped on that thread. For now, forced visibility proves the drawing works; event-driven show/hide remains flaky.
