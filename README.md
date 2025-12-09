@@ -39,7 +39,7 @@ cd J:\whistxt\rust
 Config lives at `%APPDATA%\WhisTray\config.json` (created on first run).
 
 ## Models (not in repo)
-- Default expected path: `J:/whistxt/models/ggml-small-q5_1.bin` (set in config).
+- Default expected path: J:/whistxt/models/[ggml-small-q5_1.bin](https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin) (set in config).
 - Models are **not** committed; place your `.bin`/`.gguf` under `models/` and update config if needed.
 - Provide/download your own and verify checksum; add a small download script if distributing externally.
 
