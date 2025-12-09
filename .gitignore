@@ -1,0 +1,31 @@
+# Rust build outputs
+/target/
+**/*.rs.bk
+
+# Cargo/metadata
+/.cargo/
+Cargo.lock
+
+# Editor/OS noise
+/.DS_Store
+Thumbs.db
+*.log
+
+# Local binaries and artifacts
+/dist/
+/build/
+/out/
+
+# Models and large blobs (keep out of VCS)
+/models/*.bin
+/models/*.gguf
+/models/*.pt
+/models/*.safetensors
+/models/*.onnx
+
+# Python/venv (if added later)
+/.venv/
+/.env/
+__pycache__/
+/Dependencies_x64
+/rust/target
