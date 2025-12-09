@@ -13,25 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
-};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::HBRUSH;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
-};
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetMessageW, LoadIconW, LoadImageW, PeekMessageW, PostQuitMessage, RegisterClassW,
-    RemoveMenu, SetForegroundWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, HMENU,
-    IDI_APPLICATION, IMAGE_ICON, LR_SHARED, MF_BYPOSITION, MSG, PM_REMOVE, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WNDCLASSW, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP,
-    GetCursorPos, PostMessageW, WM_NULL, WM_QUIT,
-    WS_OVERLAPPEDWINDOW,
 };
 
 const DEFAULT_MODEL_PATH: &str = "J:/whistxt/models/ggml-small-q5_1.bin";
@@ -39,10 +24,6 @@ const DEFAULT_HOTKEY: &str = "Ctrl+Shift";
 const DEFAULT_POLL_HZ: u64 = 30;
 const CUDA_BUILD_ENABLED: bool = cfg!(feature = "cuda");
 const MAX_SAMPLES: usize = 16_000 * 120; // ~2 minutes of audio
-const STARTUP_LINK_NAME: &str = "WhisTxtR.lnk";
-const WM_TRAYICON: u32 = 0x0400 + 1;
-const ID_TRAY_QUIT: u16 = 1;
-const ID_TRAY_STARTUP: u16 = 2;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -186,37 +167,6 @@ fn default_config_path() -> PathBuf {
     }
 }
 
-fn startup_link_path() -> PathBuf {
-    let startup = env::var("APPDATA").unwrap_or_default();
-    PathBuf::from(startup)
-        .join("Microsoft")
-        .join("Windows")
-        .join("Start Menu")
-        .join("Programs")
-        .join("Startup")
-        .join(STARTUP_LINK_NAME)
-}
-
-fn enable_startup() -> Result<(), String> {
-    let exe = env::current_exe().map_err(|e| format!("exe path: {e}"))?;
-    let link_path = startup_link_path();
-    let sl = mslnk::ShellLink::new(exe).map_err(|e| format!("ShellLink: {e}"))?;
-    sl.create_lnk(&link_path)
-        .map_err(|e| format!("create startup link: {e}"))
-}
-
-fn disable_startup() -> Result<(), String> {
-    let link_path = startup_link_path();
-    if link_path.exists() {
-        fs::remove_file(&link_path).map_err(|e| format!("remove link: {e}"))?;
-    }
-    Ok(())
-}
-
-fn is_startup_enabled() -> bool {
-    startup_link_path().exists()
-}
-
 fn load_or_init_config(path: &Path) -> Result<Config, AppError> {
     if path.exists() {
         let data = fs::read_to_string(path)?;
@@ -272,9 +222,6 @@ fn app_loop(
     config: Config,
     overlay: OverlayHandle,
 ) -> Result<(), AppError> {
-    // Start Win32 tray (hidden window + notify icon)
-    let mut tray = Tray::start(is_startup_enabled())?;
-
     // Block on Ctrl+C; process speech events and inject.
     ctrlc::set_handler(move || {
         info!("Ctrl+C received, exiting.");
@@ -283,12 +230,6 @@ fn app_loop(
     .map_err(|e| AppError::Msg(format!("failed to set Ctrl+C handler: {e}")))?;
 
     loop {
-        // Pump window messages (tray); break if WM_QUIT received.
-        if !tray.pump() {
-            info!("Tray requested quit (WM_QUIT)");
-            break;
-        }
-
         let ev = match event_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(ev) => ev,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -319,27 +260,6 @@ fn app_loop(
                 overlay.send(OverlayMsg::Transcript(to_inject.clone()));
                 if let Err(e) = inject_text(&to_inject, config.inject_mode.clone()) {
                     error!("inject failed: {}", e);
-                }
-            }
-        }
-
-        // Handle tray commands (quit/startup toggle)
-        while let Some(cmd) = tray.try_recv_cmd() {
-            match cmd {
-                TrayCmd::Quit => {
-                    info!("Tray quit requested");
-                    return Ok(());
-                }
-                TrayCmd::ToggleStartup => {
-                    let now = !is_startup_enabled();
-                    if now {
-                        if let Err(e) = enable_startup() {
-                            error!("Enable startup failed: {e}");
-                        }
-                    } else if let Err(e) = disable_startup() {
-                        error!("Disable startup failed: {e}");
-                    }
-                    tray.set_startup_checked(is_startup_enabled());
                 }
             }
         }
@@ -671,222 +591,4 @@ impl OverlayHandle {
 fn start_overlay() -> OverlayHandle {
     // Overlay temporarily disabled to avoid Win11-only wgpu/WinRT loader deps on Win10.
     OverlayHandle
-}
-
-// ----- Win32 tray (NotifyIcon) -----
-
-enum TrayCmd {
-    Quit,
-    ToggleStartup,
-}
-
-struct Tray {
-    hwnd: HWND,
-    hmenu: HMENU,
-    cmd_rx: Receiver<TrayCmd>,
-}
-
-static mut TRAY_CMD_TX: Option<Sender<TrayCmd>> = None;
-fn send_tray_cmd(cmd: TrayCmd) {
-    unsafe {
-        if let Some(tx) = TRAY_CMD_TX.as_ref() {
-            let _ = tx.send(cmd);
-        }
-    }
-}
-
-impl Tray {
-    fn start(startup_checked: bool) -> Result<Self, AppError> {
-        unsafe {
-            let hinstance = GetModuleHandleW(std::ptr::null());
-            let class_name = wide("WhisTrayHidden");
-            let wc = WNDCLASSW {
-                style: 0,
-                lpfnWndProc: Some(tray_wnd_proc),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: hinstance,
-                hIcon: LoadIconW(0, IDI_APPLICATION as *const u16),
-                hCursor: 0,
-                hbrBackground: 0 as HBRUSH,
-                lpszMenuName: std::ptr::null(),
-                lpszClassName: class_name.as_ptr(),
-            };
-            if RegisterClassW(&wc) == 0 {
-                return Err(AppError::Msg("RegisterClassW failed".into()));
-            }
-
-            let hwnd = CreateWindowExW(
-                0,
-                class_name.as_ptr(),
-                class_name.as_ptr(),
-                WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                0,
-                0,
-                hinstance,
-                std::ptr::null(),
-            );
-            if hwnd == 0 {
-                return Err(AppError::Msg("CreateWindowExW failed".into()));
-            }
-
-            let hmenu = CreatePopupMenu();
-            append_menu_str(hmenu, ID_TRAY_STARTUP as u32, startup_label(startup_checked));
-            append_menu_str(hmenu, ID_TRAY_QUIT as u32, "Quit");
-
-            let (tx, rx) = mpsc::channel::<TrayCmd>();
-            TRAY_CMD_TX = Some(tx);
-
-            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = hwnd;
-            nid.uID = 1;
-            nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON;
-            nid.uCallbackMessage = WM_TRAYICON;
-            nid.hIcon = LoadImageW(
-                0,
-                IDI_APPLICATION as *const u16,
-                IMAGE_ICON,
-                16,
-                16,
-                LR_SHARED,
-            ) as isize;
-            let tip = wide("WhisTxtR (right-click for menu)");
-            nid.szTip[..tip.len()].copy_from_slice(&tip);
-            Shell_NotifyIconW(NIM_ADD, &mut nid);
-
-            Ok(Tray { hwnd, hmenu, cmd_rx: rx })
-        }
-    }
-
-    fn pump(&mut self) -> bool {
-        unsafe {
-            let mut msg: MSG = std::mem::zeroed();
-            while PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) != 0 {
-                if msg.message == WM_QUIT as u32 {
-                    send_tray_cmd(TrayCmd::Quit);
-                    return false;
-                }
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        true
-    }
-
-    fn try_recv_cmd(&self) -> Option<TrayCmd> {
-        self.cmd_rx.try_recv().ok()
-    }
-
-    fn set_startup_checked(&self, on: bool) {
-        unsafe {
-            // Rebuild the menu label to reflect current state.
-            while RemoveMenu(self.hmenu, 0, MF_BYPOSITION) != 0 {}
-            append_menu_str(self.hmenu, ID_TRAY_STARTUP as u32, startup_label(on));
-            append_menu_str(self.hmenu, ID_TRAY_QUIT as u32, "Quit");
-        }
-    }
-}
-
-fn startup_label(enabled: bool) -> &'static str {
-    if enabled {
-        "Disable Start with Windows"
-    } else {
-        "Enable Start with Windows"
-    }
-}
-
-extern "system" fn tray_wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    unsafe {
-        match msg {
-            WM_TRAYICON => {
-                if lparam as u32 == WM_RBUTTONUP {
-                    SetForegroundWindow(hwnd);
-                    // Build a fresh menu near the cursor.
-                    let hmenu = CreatePopupMenu();
-                    let startup = is_startup_enabled();
-                    append_menu_str(hmenu, ID_TRAY_STARTUP as u32, startup_label(startup));
-                    append_menu_str(hmenu, ID_TRAY_QUIT as u32, "Quit");
-                    let mut pt = POINT { x: 0, y: 0 };
-                    GetCursorPos(&mut pt);
-                    let sel = TrackPopupMenu(
-                        hmenu,
-                        TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
-                        pt.x,
-                        pt.y,
-                        0,
-                        hwnd,
-                        std::ptr::null(),
-                    );
-                    match sel as u16 {
-                        ID_TRAY_QUIT => {
-                            send_tray_cmd(TrayCmd::Quit);
-                            PostQuitMessage(0);
-                        }
-                        ID_TRAY_STARTUP => {
-                            send_tray_cmd(TrayCmd::ToggleStartup);
-                        }
-                        _ => {}
-                    }
-                    // Per docs, post a null message after TrackPopupMenu.
-                    PostMessageW(hwnd, WM_NULL, 0, 0);
-                }
-                0
-            }
-            WM_COMMAND => {
-                let id = (wparam & 0xFFFF) as u16;
-                match id {
-                    ID_TRAY_QUIT => {
-                        send_tray_cmd(TrayCmd::Quit);
-                        PostQuitMessage(0);
-                    }
-                    ID_TRAY_STARTUP => {
-                        send_tray_cmd(TrayCmd::ToggleStartup);
-                    }
-                    _ => {}
-                }
-                0
-            }
-            WM_DESTROY => {
-                Shell_NotifyIconW(
-                    NIM_DELETE,
-                    &mut NOTIFYICONDATAW {
-                        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                        hWnd: hwnd,
-                        uID: 1,
-                        ..unsafe { std::mem::zeroed() }
-                    },
-                );
-                PostQuitMessage(0);
-                0
-            }
-            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-        }
-    }
-}
-
-fn append_menu_str(hmenu: HMENU, id: u32, label: &str) {
-    let w = wide(label);
-    unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::AppendMenuW(
-            hmenu,
-            0,
-            id as usize,
-            w.as_ptr(),
-        );
-    }
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }

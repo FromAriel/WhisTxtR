@@ -22,12 +22,3 @@ arboard = "3"
 enigo = "0.1"
 parking_lot = "0.12"
 ctrlc = "3"
-mslnk = "0.1"
-windows-sys = { version = "0.52", features = [
-    "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Shell",
-    "Win32_Graphics_Gdi",
-    "Win32_System_LibraryLoader",
-    "Win32_System_SystemServices",
-] }
